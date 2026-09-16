@@ -116,15 +116,24 @@ fun ResultsScreen(
             QuickStatCard(
                 label = "CANTHAL TILT",
                 value = String.format("%+.1f°", result.canthalTiltDegrees),
-                subtext = if (result.canthalTiltDegrees >= 2.0f) "Hunter Eye" else "Neutral",
-                accentColor = NeonCyan,
+                subtext = when {
+                    result.canthalTiltDegrees >= 2.0f -> "Hunter Eye"
+                    result.canthalTiltDegrees >= -0.5f -> "Neutral"
+                    else -> "Negative Tilt"
+                },
+                accentColor = if (result.canthalTiltDegrees >= 1.5f) NeonCyan else if (result.canthalTiltDegrees >= -0.5f) NeonGold else NeonRose,
                 modifier = Modifier.weight(1f)
             )
             QuickStatCard(
                 label = "SYMMETRY",
                 value = "${result.facialSymmetryPct}%",
-                subtext = if (result.facialSymmetryPct >= 90) "Elite Match" else "Balanced",
-                accentColor = NeonPurple,
+                subtext = when {
+                    result.facialSymmetryPct >= 85 -> "Elite Match"
+                    result.facialSymmetryPct >= 70 -> "Balanced"
+                    result.facialSymmetryPct >= 55 -> "Moderate"
+                    else -> "Asymmetric"
+                },
+                accentColor = if (result.facialSymmetryPct >= 75) NeonPurple else if (result.facialSymmetryPct >= 60) NeonGold else NeonRose,
                 modifier = Modifier.weight(1f)
             )
             QuickStatCard(
