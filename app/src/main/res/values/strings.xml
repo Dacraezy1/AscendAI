@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">AscendAI</string>
+    <string name="app_tagline">Facial Aesthetics &amp; Ascension Engine</string>
+    <string name="camera_permission_required">Camera permission is required to analyze facial symmetry and jawline.</string>
+    <string name="storage_permission_required">Storage permission is required to select photos from gallery.</string>
+</resources>
