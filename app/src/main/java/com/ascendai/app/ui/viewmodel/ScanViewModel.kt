@@ -47,6 +47,14 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(frontImageUri = null, sideImageUri = null) }
     }
 
+    fun clearFrontImage() {
+        _uiState.update { it.copy(frontImageUri = null) }
+    }
+
+    fun clearSideImage() {
+        _uiState.update { it.copy(sideImageUri = null) }
+    }
+
     fun setSelectedCategory(category: GuideCategory) {
         _uiState.update { it.copy(selectedCategory = category) }
     }

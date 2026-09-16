@@ -27,7 +27,18 @@ fun RadarMetricChart(
 ) {
     if (metrics.isEmpty()) return
 
-    val labels = listOf("Jawline", "Eyes", "Symmetry", "Thirds", "Skin", "Cheeks")
+    val labels = metrics.take(6).map { m ->
+        when {
+            m.name.contains("Jaw", ignoreCase = true) -> "Jawline"
+            m.name.contains("Eye", ignoreCase = true) || m.name.contains("Canthal", ignoreCase = true) -> "Eyes"
+            m.name.contains("Symmetry", ignoreCase = true) -> "Symmetry"
+            m.name.contains("Thirds", ignoreCase = true) || m.name.contains("Midface", ignoreCase = true) -> "Thirds"
+            m.name.contains("Skin", ignoreCase = true) -> "Skin"
+            m.name.contains("Cheek", ignoreCase = true) -> "Cheeks"
+            m.name.contains("fWHR", ignoreCase = true) -> "fWHR"
+            else -> m.name.take(7)
+        }
+    }
     val scores = metrics.take(6).map { it.score.toFloat() / 100f }
     val displayScores = if (scores.size < 6) {
         scores + List(6 - scores.size) { 0.8f }

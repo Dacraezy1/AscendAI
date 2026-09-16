@@ -4,14 +4,17 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.TipsAndUpdates
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -108,7 +111,7 @@ fun ResultsScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Quick Biometric Stats Pill Row
+        // Quick Biometric Stats - Row 1
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -145,7 +148,226 @@ fun ResultsScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Quick Biometric Stats - Row 2 (PSL Dimensions)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            QuickStatCard(
+                label = "fWHR",
+                value = String.format("%.2f", result.fwhr),
+                subtext = when {
+                    result.fwhr in 1.84f..2.05f -> "Apex Dimorphic"
+                    result.fwhr in 1.74f..1.83f -> "Favorable"
+                    result.fwhr in 1.63f..1.73f -> "Standard"
+                    else -> "Narrow Face"
+                },
+                accentColor = if (result.fwhr in 1.82f..2.05f) NeonCyan else if (result.fwhr in 1.70f..1.82f) NeonGold else NeonRose,
+                modifier = Modifier.weight(1f)
+            )
+            QuickStatCard(
+                label = "MIDFACE RATIO",
+                value = String.format("%.2f", result.midfaceRatio),
+                subtext = when {
+                    result.midfaceRatio in 0.98f..1.08f -> "Compact Ideal"
+                    result.midfaceRatio in 0.92f..0.97f -> "Balanced"
+                    else -> "Elongated"
+                },
+                accentColor = if (result.midfaceRatio in 0.96f..1.08f) NeonCyan else if (result.midfaceRatio in 0.90f..0.96f) NeonGold else NeonRose,
+                modifier = Modifier.weight(1f)
+            )
+            QuickStatCard(
+                label = "EYE SPACING",
+                value = String.format("%.2f", result.eyeSpacingRatio),
+                subtext = when {
+                    result.eyeSpacingRatio in 0.95f..1.05f -> "Golden 1.0"
+                    result.eyeSpacingRatio < 0.95f -> "Close-Set"
+                    else -> "Wide-Set"
+                },
+                accentColor = if (result.eyeSpacingRatio in 0.94f..1.06f) NeonPurple else NeonGold,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // -----------------------------------------------------------------
+        // HALOS & FAILOS DIAGNOSTIC (UMAX STYLE)
+        // -----------------------------------------------------------------
+        if (result.halos.isNotEmpty() || result.failos.isNotEmpty()) {
+            Text(
+                text = "AESTHETIC DIAGNOSTIC",
+                style = Typography.labelSmall.copy(
+                    letterSpacing = 1.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary
+                ),
+                modifier = Modifier.align(Alignment.Start)
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Halos Card (Strengths)
+            if (result.halos.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(SurfaceCard)
+                        .border(1.dp, NeonEmerald.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                        .padding(14.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = NeonEmerald,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "HALOS (STANDOUT STRENGTHS)",
+                                style = Typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = NeonEmerald,
+                                    letterSpacing = 1.sp
+                                )
+                            )
+                        }
+                        result.halos.forEach { halo ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(NeonEmerald)
+                                )
+                                Text(
+                                    text = halo,
+                                    style = Typography.bodyMedium.copy(
+                                        color = TextPrimary,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
+            // Failos Card (Bottlenecks)
+            if (result.failos.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(SurfaceCard)
+                        .border(1.dp, NeonRose.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+                        .padding(14.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = NeonRose,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "FAILOS (LIMITING BOTTLENECKS)",
+                                style = Typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = NeonRose,
+                                    letterSpacing = 1.sp
+                                )
+                            )
+                        }
+                        result.failos.forEach { failo ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(NeonRose)
+                                )
+                                Text(
+                                    text = failo,
+                                    style = Typography.bodyMedium.copy(
+                                        color = TextPrimary,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+        }
+
+        // Side Profile Biometrics Card
+        if (result.sideProfileSummary != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(SurfaceCard)
+                    .border(1.dp, NeonCyan.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                    .padding(14.dp)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Face,
+                            contentDescription = null,
+                            tint = NeonCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = "LATERAL PROFILE & GONIAL BIOMETRICS",
+                            style = Typography.labelSmall.copy(
+                                fontWeight = FontWeight.Black,
+                                color = NeonCyan,
+                                letterSpacing = 1.sp
+                            )
+                        )
+                    }
+                    Text(
+                        text = result.sideProfileSummary,
+                        style = Typography.bodyMedium.copy(
+                            color = TextSecondary,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(20.dp))
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         // 6-Axis Radar Chart Section
         Text(
@@ -317,22 +539,24 @@ fun QuickStatCard(
             .clip(RoundedCornerShape(14.dp))
             .background(SurfaceCard)
             .border(1.dp, BorderGlass, RoundedCornerShape(14.dp))
-            .padding(12.dp)
+            .padding(10.dp)
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
             Text(
                 text = label,
                 style = Typography.labelSmall.copy(
-                    fontSize = 9.sp,
+                    fontSize = 8.5.sp,
                     letterSpacing = 1.sp,
                     color = TextMuted
-                )
+                ),
+                maxLines = 1
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = value,
                 style = Typography.titleLarge.copy(
                     fontWeight = FontWeight.Black,
+                    fontSize = 17.sp,
                     color = accentColor
                 )
             )
@@ -340,10 +564,11 @@ fun QuickStatCard(
             Text(
                 text = subtext,
                 style = Typography.labelSmall.copy(
-                    fontSize = 10.sp,
+                    fontSize = 9.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = TextSecondary
-                )
+                ),
+                maxLines = 1
             )
         }
     }

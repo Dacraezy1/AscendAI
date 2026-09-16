@@ -166,18 +166,18 @@ fun ScanScreen(
                 uri = uiState.frontImageUri,
                 onCameraClick = { handleCameraCapture("front") },
                 onGalleryClick = { handleGalleryPick("front") },
-                onClear = { viewModel.clearImages() },
+                onClear = { viewModel.clearFrontImage() },
                 modifier = Modifier.weight(1f)
             )
 
             // Side Photo Slot (Recommended)
             PhotoSlotCard(
                 title = "Side Profile",
-                subtitle = "Gonial Angle",
+                subtitle = "Gonial & E-Line",
                 uri = uiState.sideImageUri,
                 onCameraClick = { handleCameraCapture("side") },
                 onGalleryClick = { handleGalleryPick("side") },
-                onClear = { /* can clear side */ },
+                onClear = { viewModel.clearSideImage() },
                 modifier = Modifier.weight(1f)
             )
         }

@@ -12,5 +12,12 @@ data class AnalysisResult(
     val topAscensionFocus: List<String>,
     val goldenRatioHarmony: Float = 0.88f,
     val canthalTiltDegrees: Float = 4.2f,
-    val facialSymmetryPct: Int = 89
+    val facialSymmetryPct: Int = 89,
+    val fwhr: Float = 1.82f,
+    val midfaceRatio: Float = 1.00f,
+    val eyeSpacingRatio: Float = 1.00f,
+    val halos: List<String> = emptyList(),
+    val failos: List<String> = emptyList(),
+    val sideProfileSummary: String? = null,
+    val hasSideAnalysis: Boolean = false
 )
