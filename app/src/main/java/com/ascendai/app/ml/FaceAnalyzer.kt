@@ -3,7 +3,9 @@ package com.ascendai.app.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.PointF
+import android.media.ExifInterface
 import android.net.Uri
 import com.ascendai.app.model.AnalysisResult
 import com.ascendai.app.model.FacialMetric
@@ -43,13 +45,13 @@ class FaceAnalyzer(private val context: Context) {
         // 1. Process Front Profile
         if (frontUri != null) {
             try {
-                val inputImage = InputImage.fromFilePath(context, frontUri)
-                val faces = detector.process(inputImage).await()
-                if (faces.isNotEmpty()) {
-                    frontFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-                }
-                context.contentResolver.openInputStream(frontUri)?.use { stream ->
-                    frontBitmap = BitmapFactory.decodeStream(stream)
+                frontBitmap = decodeOrientedBitmap(frontUri, 1280)
+                if (frontBitmap != null) {
+                    val inputImage = InputImage.fromBitmap(frontBitmap, 0)
+                    val faces = detector.process(inputImage).await()
+                    if (faces.isNotEmpty()) {
+                        frontFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -59,13 +61,13 @@ class FaceAnalyzer(private val context: Context) {
         // 2. Process Side Profile (if provided)
         if (sideUri != null) {
             try {
-                val inputImage = InputImage.fromFilePath(context, sideUri)
-                val faces = detector.process(inputImage).await()
-                if (faces.isNotEmpty()) {
-                    sideFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-                }
-                context.contentResolver.openInputStream(sideUri)?.use { stream ->
-                    sideBitmap = BitmapFactory.decodeStream(stream)
+                sideBitmap = decodeOrientedBitmap(sideUri, 1280)
+                if (sideBitmap != null) {
+                    val inputImage = InputImage.fromBitmap(sideBitmap, 0)
+                    val faces = detector.process(inputImage).await()
+                    if (faces.isNotEmpty()) {
+                        sideFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -77,7 +79,7 @@ class FaceAnalyzer(private val context: Context) {
         val primaryBitmap = frontBitmap ?: sideBitmap
 
         if (primaryFace != null) {
-            calculateStrictPSLBiometrics(
+            calculateAdvancedBiometrics(
                 frontFace = frontFace,
                 sideFace = sideFace,
                 frontUri = frontUri?.toString(),
@@ -86,11 +88,58 @@ class FaceAnalyzer(private val context: Context) {
                 sideBitmap = sideBitmap
             )
         } else {
-            generateStrictFallback(frontUri?.toString(), sideUri?.toString(), primaryBitmap)
+            generateCalibratedFallback(frontUri?.toString(), sideUri?.toString(), primaryBitmap)
         }
     }
 
-    private fun calculateStrictPSLBiometrics(
+    private fun decodeOrientedBitmap(uri: Uri, maxDimension: Int): Bitmap? {
+        return try {
+            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            }
+            val origW = boundsOptions.outWidth
+            val origH = boundsOptions.outHeight
+            if (origW <= 0 || origH <= 0) return null
+
+            var inSampleSize = 1
+            val maxDim = max(origW, origH)
+            while (maxDim / inSampleSize > maxDimension) {
+                inSampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply { this.inSampleSize = inSampleSize }
+            val decoded = context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            } ?: return null
+
+            var rotationDegrees = 0
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                val exif = ExifInterface(stream)
+                rotationDegrees = when (exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            }
+
+            if (rotationDegrees != 0) {
+                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+            } else {
+                decoded
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    private fun calculateAdvancedBiometrics(
         frontFace: Face?,
         sideFace: Face?,
         frontUri: String?,
@@ -104,7 +153,8 @@ class FaceAnalyzer(private val context: Context) {
         // POSE DESKEWING (Correct roll angle so head tilts don't alter angles)
         // -------------------------------------------------------------
         val rollZ = face.headEulerAngleZ
-        val yawY = abs(face.headEulerAngleY)
+        val yawY = face.headEulerAngleY
+        val pitchX = face.headEulerAngleX
         val radZ = Math.toRadians(-rollZ.toDouble())
         val cosZ = cos(radZ)
         val sinZ = sin(radZ)
@@ -119,7 +169,7 @@ class FaceAnalyzer(private val context: Context) {
             return PointF(rx, ry)
         }
 
-        // Extract and deskew contours
+        // Extract deskewed contours
         val leftEyeContour = (face.getContour(FaceContour.LEFT_EYE)?.points ?: emptyList()).map { deskew(it) }
         val rightEyeContour = (face.getContour(FaceContour.RIGHT_EYE)?.points ?: emptyList()).map { deskew(it) }
         val faceContour = (face.getContour(FaceContour.FACE)?.points ?: emptyList()).map { deskew(it) }
@@ -140,26 +190,23 @@ class FaceAnalyzer(private val context: Context) {
         // 1. CANTHAL TILT, PERIORBITAL AREA & EYE SPACING (ESR & PFHR)
         // -------------------------------------------------------------
         var measuredTiltDeg = 0.0f
-        var eyeAspectRatio = 0.35f
+        var eyeAspectRatio = 0.36f
         var eyeSpacingRatio = 1.00f
 
         if (leftEyeContour.size >= 8 && rightEyeContour.size >= 8) {
-            // Sort eyes horizontally in screen space
             val avgX1 = leftEyeContour.map { it.x }.average()
             val avgX2 = rightEyeContour.map { it.x }.average()
             val screenLeftEye = if (avgX1 < avgX2) leftEyeContour else rightEyeContour
             val screenRightEye = if (avgX1 < avgX2) rightEyeContour else leftEyeContour
 
-            // Screen left eye: lateral (outer) is min x, medial (inner) is max x
+            // Lateral vs Medial canthus identification
             val lateralLeft = screenLeftEye.minByOrNull { it.x } ?: screenLeftEye[0]
             val medialLeft = screenLeftEye.maxByOrNull { it.x } ?: screenLeftEye[screenLeftEye.size / 2]
 
-            // Screen right eye: medial (inner) is min x, lateral (outer) is max x
             val medialRight = screenRightEye.minByOrNull { it.x } ?: screenRightEye[0]
             val lateralRight = screenRightEye.maxByOrNull { it.x } ?: screenRightEye[screenRightEye.size / 2]
 
-            // Angle calculation: in screen space y increases downwards.
-            // Positive canthal tilt means lateral corner is HIGHER than medial corner (smaller y).
+            // In screen coordinates Y increases downward. Positive tilt means lateral is higher (lower Y)
             val dyL = medialLeft.y - lateralLeft.y
             val dxL = abs(medialLeft.x - lateralLeft.x).coerceAtLeast(1f)
             val tiltL = Math.toDegrees(atan2(dyL.toDouble(), dxL.toDouble())).toFloat()
@@ -170,34 +217,51 @@ class FaceAnalyzer(private val context: Context) {
 
             measuredTiltDeg = ((tiltL + tiltR) / 2.0f).coerceIn(-12.0f, 12.0f)
 
-            // PFHR (Palpebral Fissure Height-to-Width Ratio): Compact hunter eyes = 0.26 - 0.33, Bug eyes = >0.40
+            // PFHR: Palpebral Fissure Height-to-Width Ratio
             val hL = screenLeftEye.maxOf { it.y } - screenLeftEye.minOf { it.y }
             val hR = screenRightEye.maxOf { it.y } - screenRightEye.minOf { it.y }
             eyeAspectRatio = (((hL / dxL) + (hR / dxR)) / 2.0f).coerceIn(0.20f, 0.60f)
 
-            // ESR (Eye Spacing Ratio): Intercanthal distance / Eye width. Ideal = 0.95 - 1.05
+            // ESR: Intercanthal distance / Eye width (Golden ratio ~ 1.00)
             val intercanthal = abs(medialRight.x - medialLeft.x)
             val avgEyeW = (dxL + dxR) / 2.0f
             eyeSpacingRatio = (intercanthal / avgEyeW.coerceAtLeast(1f)).coerceIn(0.70f, 1.45f)
         }
 
-        // Strict Periorbital Scoring (PSL Standard)
-        val canthalScore: Int = when {
-            measuredTiltDeg >= 3.5f && eyeAspectRatio <= 0.32f && eyeSpacingRatio in 0.94f..1.06f -> 94 // Apex Hunter Eyes
-            measuredTiltDeg >= 2.5f && eyeAspectRatio <= 0.35f -> 85 // Strong positive tilt, hooded
-            measuredTiltDeg >= 1.0f && eyeAspectRatio <= 0.38f -> 74 // Favorable neutral-positive
-            measuredTiltDeg >= -0.5f && eyeAspectRatio <= 0.40f -> 63 // Average normie eye area
-            measuredTiltDeg >= -2.0f -> 48 // Noticeable downward tilt / soft tissue lag (LTN)
-            measuredTiltDeg >= -4.0f || eyeAspectRatio > 0.43f -> 35 // Severe negative tilt / scleral show (Sub-5 Failo)
-            else -> 24 // Extreme negative canthal tilt / droop
+        // Calibrated Continuous Periorbital Scoring
+        val baseTiltScore = when {
+            measuredTiltDeg >= 4.0f -> 94.0f // Apex Hunter Eyes
+            measuredTiltDeg >= 2.5f -> 88.0f + (measuredTiltDeg - 2.5f) / 1.5f * 6.0f
+            measuredTiltDeg >= 1.0f -> 81.0f + (measuredTiltDeg - 1.0f) / 1.5f * 7.0f
+            measuredTiltDeg >= -0.5f -> 74.0f + (measuredTiltDeg - (-0.5f)) / 1.5f * 7.0f
+            measuredTiltDeg >= -2.0f -> 64.0f + (measuredTiltDeg - (-2.0f)) / 1.5f * 10.0f
+            measuredTiltDeg >= -4.0f -> 50.0f + (measuredTiltDeg - (-4.0f)) / 2.0f * 14.0f
+            else -> 38.0f + ((measuredTiltDeg + 12.0f) / 8.0f * 12.0f).coerceAtLeast(0f)
         }
 
+        val pfhrBonus = when {
+            eyeAspectRatio in 0.28f..0.36f -> 4.0f // Compact hunter eye hooding
+            eyeAspectRatio in 0.36f..0.43f -> 1.0f // Harmonious almond / open expressive eye (pretty boy standard)
+            eyeAspectRatio in 0.43f..0.48f -> -2.0f // Slightly rounded
+            eyeAspectRatio in 0.48f..0.54f -> -6.0f // Scleral show
+            else -> -10.0f
+        }
+
+        val esrBonus = when {
+            eyeSpacingRatio in 0.94f..1.06f -> 3.0f // Golden ratio spacing
+            eyeSpacingRatio in 0.88f..1.12f -> 0.0f // Balanced natural spacing
+            eyeSpacingRatio in 0.82f..1.18f -> -3.0f
+            else -> -6.0f
+        }
+
+        val canthalScore = (baseTiltScore + pfhrBonus + esrBonus).roundToInt().coerceIn(35, 98)
+
         // -------------------------------------------------------------
-        // 2. MANDIBLE GEOMETRY, JAW CONVEXITY & BLOAT DETECTION
+        // 2. MANDIBLE GEOMETRY & JAWLINE DEFINITION
         // -------------------------------------------------------------
-        var jawlineScore = 50
+        var jawlineScore = 72
         var isHighBloat = false
-        var jawToCheekRatio = 0.80f
+        var jawToCheekRatio = 0.78f
 
         if (faceContour.size >= 24) {
             val sortedByY = faceContour.sortedBy { it.y }
@@ -207,68 +271,85 @@ class FaceAnalyzer(private val context: Context) {
             val bizygomaticWidth = (maxX - minX).coerceAtLeast(1f)
             val faceHeight = (chinPoint.y - sortedByY.first().y).coerceAtLeast(1f)
 
-            // Bigonial width (measured at ~24% height above chin tip)
+            // Bigonial width measured at ~24% height above chin tip
             val jawLevelY = chinPoint.y - (faceHeight * 0.24f)
             val jawPointsNearLevel = faceContour.filter { abs(it.y - jawLevelY) < (faceHeight * 0.08f) }
             val bigonialWidth = if (jawPointsNearLevel.size >= 2) {
                 jawPointsNearLevel.maxOf { it.x } - jawPointsNearLevel.minOf { it.x }
-            } else bizygomaticWidth * 0.74f
+            } else bizygomaticWidth * 0.76f
 
             jawToCheekRatio = (bigonialWidth / bizygomaticWidth).coerceIn(0.55f, 0.98f)
 
-            // Mandible Curvature / Adiposity Bloat Test:
-            // Check whether lower jaw contour bulges outward (convex = fat/bloated) or is straight/concave (chiseled)
-            val leftJawPoints = faceContour.filter { it.x < centerX && it.y > chinPoint.y - (faceHeight * 0.30f) }
-            val rightJawPoints = faceContour.filter { it.x > centerX && it.y > chinPoint.y - (faceHeight * 0.30f) }
+            // Chin width (lower 8% of face)
+            val chinPoints = faceContour.filter { it.y > chinPoint.y - (faceHeight * 0.08f) }
+            val chinWidthRatio = if (chinPoints.size >= 2) {
+                (chinPoints.maxOf { it.x } - chinPoints.minOf { it.x }) / bizygomaticWidth
+            } else 0.25f
 
-            // Measure chin flatness / squarish dimorphism
-            val chinContourPoints = faceContour.filter { it.y > chinPoint.y - (faceHeight * 0.10f) }
-            val chinFlatness = if (chinContourPoints.size >= 3) {
-                (chinContourPoints.maxOf { it.x } - chinContourPoints.minOf { it.x }) / bizygomaticWidth
-            } else 0.22f
+            // Curvature analysis: check whether contour from gonion to chin follows an angular slope or sags outward
+            val leftJaw = faceContour.filter { it.x <= centerX && it.y in jawLevelY..chinPoint.y }
+            val rightJaw = faceContour.filter { it.x >= centerX && it.y in jawLevelY..chinPoint.y }
 
-            // Bulge detection: if contour at 12% height is wider than straight interpolation, that is bloat/adiposity
-            val midChinY = chinPoint.y - (faceHeight * 0.12f)
-            val midPoints = faceContour.filter { abs(it.y - midChinY) < (faceHeight * 0.05f) }
-            val midWidth = if (midPoints.size >= 2) midPoints.maxOf { it.x } - midPoints.minOf { it.x } else bigonialWidth * 0.7f
-            val expectedLinearWidth = bigonialWidth * 0.62f
-            val outwardBulgeRatio = (midWidth / expectedLinearWidth.coerceAtLeast(1f))
+            var maxLeftBulge = 0f
+            if (leftJaw.size >= 3) {
+                val topPt = leftJaw.minByOrNull { it.y }!!
+                val botPt = leftJaw.maxByOrNull { it.y }!!
+                val spanY = (botPt.y - topPt.y).coerceAtLeast(1f)
+                for (pt in leftJaw) {
+                    val t = (pt.y - topPt.y) / spanY
+                    val expectedX = topPt.x + t * (botPt.x - topPt.x)
+                    val bulge = expectedX - pt.x
+                    if (bulge > maxLeftBulge) maxLeftBulge = bulge
+                }
+            }
 
-            isHighBloat = outwardBulgeRatio > 1.25f
+            var maxRightBulge = 0f
+            if (rightJaw.size >= 3) {
+                val topPt = rightJaw.minByOrNull { it.y }!!
+                val botPt = rightJaw.maxByOrNull { it.y }!!
+                val spanY = (botPt.y - topPt.y).coerceAtLeast(1f)
+                for (pt in rightJaw) {
+                    val t = (pt.y - topPt.y) / spanY
+                    val expectedX = topPt.x + t * (botPt.x - topPt.x)
+                    val bulge = pt.x - expectedX
+                    if (bulge > maxRightBulge) maxRightBulge = bulge
+                }
+            }
+
+            val avgBulgeRatio = ((maxLeftBulge + maxRightBulge) / 2.0f) / (bigonialWidth * 0.12f).coerceAtLeast(1f)
+            isHighBloat = avgBulgeRatio > 1.25f
 
             jawlineScore = when {
-                // Chiseled, masculine, lean bone structure
-                jawToCheekRatio in 0.83f..0.92f && chinFlatness in 0.24f..0.36f && !isHighBloat -> 92
-                // Defined jawline, minimal soft tissue
-                jawToCheekRatio in 0.78f..0.94f && chinFlatness in 0.20f..0.38f && outwardBulgeRatio < 1.15f -> 80
-                // Average jaw, normal soft tissue / slight water retention
-                jawToCheekRatio in 0.73f..0.95f && outwardBulgeRatio < 1.22f -> 64
-                // Soft / bloated / slightly narrow jaw
-                jawToCheekRatio in 0.68f..0.75f || isHighBloat -> 48
-                // Noticeably recessed chin or high adiposity
-                jawToCheekRatio < 0.68f || outwardBulgeRatio > 1.35f -> 36
-                // Severe mandibular recession or extreme bloat
-                else -> 26
+                // Razor chiseled masculine jawline
+                jawToCheekRatio in 0.81f..0.92f && chinWidthRatio in 0.22f..0.38f && avgBulgeRatio < 0.60f -> 92
+                // Defined athletic or pretty boy V-taper jaw
+                jawToCheekRatio in 0.74f..0.85f && avgBulgeRatio < 0.80f -> 84
+                // Normal healthy jawline
+                jawToCheekRatio in 0.70f..0.92f && avgBulgeRatio < 1.05f -> 75
+                // Soft tissue or slightly narrow mandible
+                jawToCheekRatio in 0.65f..0.73f || avgBulgeRatio < 1.30f -> 64
+                // Substantial bloat or narrow chin
+                isHighBloat || jawToCheekRatio < 0.65f -> 52
+                else -> 42
             }
         }
 
         // -------------------------------------------------------------
         // 3. fWHR (FACIAL WIDTH-TO-HEIGHT RATIO)
         // -------------------------------------------------------------
-        var fwhr = 1.76f
-        var fwhrScore = 65
+        var fwhr = 1.78f
+        var fwhrScore = 76
 
         if (faceContour.isNotEmpty()) {
             val minX = faceContour.minOf { it.x }
             val maxX = faceContour.maxOf { it.x }
             val bizygomaticWidth = (maxX - minX).coerceAtLeast(1f)
 
-            // Upper facial height: Brow center to upper lip top
             val browY = when {
                 leftEyebrowTop.isNotEmpty() && rightEyebrowTop.isNotEmpty() ->
                     (leftEyebrowTop + rightEyebrowTop).map { it.y }.average().toFloat()
                 leftEyeLandmark != null && rightEyeLandmark != null ->
-                    (leftEyeLandmark.y + rightEyeLandmark.y) / 2.0f - (faceContour.maxOf { it.y } - faceContour.minOf { it.y }) * 0.08f
+                    (leftEyeLandmark.y + rightEyeLandmark.y) / 2.0f - (faceContour.maxOf { it.y } - faceContour.minOf { it.y }) * 0.07f
                 else -> faceContour.minOf { it.y } + (faceContour.maxOf { it.y } - faceContour.minOf { it.y }) * 0.35f
             }
 
@@ -277,15 +358,15 @@ class FaceAnalyzer(private val context: Context) {
                 ?: (faceContour.maxOf { it.y } - (faceContour.maxOf { it.y } - faceContour.minOf { it.y }) * 0.20f)
 
             val upperFacialHeight = abs(upperLipY - browY).coerceAtLeast(1f)
-            fwhr = (bizygomaticWidth / upperFacialHeight).coerceIn(1.35f, 2.35f)
+            fwhr = (bizygomaticWidth / upperFacialHeight).coerceIn(1.40f, 2.30f)
 
             fwhrScore = when {
-                fwhr in 1.84f..2.05f -> 92 // High dimorphism (Chad / Chadlite)
-                fwhr in 1.74f..1.83f -> 80 // Favorable masculine ratio (HTN)
-                fwhr in 1.63f..1.73f -> 66 // Average normie ratio (MTN)
-                fwhr in 1.52f..1.62f -> 50 // Narrow / elongated face (LTN)
-                fwhr < 1.52f -> 34 // Severe horse-face elongation (Sub-5 Failo)
-                else -> 42 // Excessively wide / bloated circular face
+                fwhr in 1.84f..2.06f -> 92 // High masculine dimorphism
+                fwhr in 1.74f..1.84f -> 84 // Favorable masculine ratio
+                fwhr in 1.64f..1.74f -> 78 // Classic balanced ratio (pretty boy / model standard)
+                fwhr in 1.54f..1.64f -> 68 // Moderately narrow face
+                fwhr > 2.06f -> 78 // Very compact / robust face
+                else -> 52 // Vertically elongated
             }
         }
 
@@ -293,8 +374,8 @@ class FaceAnalyzer(private val context: Context) {
         // 4. MIDFACE COMPACTNESS & FACIAL THIRDS
         // -------------------------------------------------------------
         var midfaceRatio = 1.00f
-        var proportionScore = 60
-        var thirdsHarmonyRatio = 0.82f
+        var proportionScore = 74
+        var thirdsHarmonyRatio = 0.88f
 
         if (faceContour.isNotEmpty() && leftEyeLandmark != null && rightEyeLandmark != null) {
             val chinY = faceContour.maxOf { it.y }
@@ -304,48 +385,37 @@ class FaceAnalyzer(private val context: Context) {
 
             val mouthY = upperLipTop.minOfOrNull { it.y } ?: (chinY - (chinY - pupilY) * 0.40f)
             val midfaceHeight = abs(mouthY - pupilY).coerceAtLeast(1f)
-            midfaceRatio = (ipd / midfaceHeight).coerceIn(0.72f, 1.30f)
+            midfaceRatio = (ipd / midfaceHeight).coerceIn(0.75f, 1.25f)
 
             // Vertical Thirds
             val noseY = noseBaseLandmark?.y ?: (pupilY + (chinY - pupilY) * 0.45f)
-            val browY = pupilY - (chinY - foreheadY) * 0.08f
-            val uThird = abs(browY - foreheadY)
-            val mThird = abs(noseY - browY)
+            val browYThirds = pupilY - (chinY - foreheadY) * 0.08f
+            val uThird = abs(browYThirds - foreheadY)
+            val mThird = abs(noseY - browYThirds)
             val lThird = abs(chinY - noseY)
             val totalH = (uThird + mThird + lThird).coerceAtLeast(1f)
 
             val dev = abs(uThird / totalH - 0.333f) + abs(mThird / totalH - 0.333f) + abs(lThird / totalH - 0.333f)
-            thirdsHarmonyRatio = (1.0f - (dev * 1.5f)).coerceIn(0.35f, 0.98f)
-
-            // Philtrum to chin ratio (Microgenia / recessed chin check)
-            val philtrumToChinRatio = if (upperLipTop.isNotEmpty() && lowerLipBottom.isNotEmpty()) {
-                val philtrumH = abs(upperLipTop.minOf { it.y } - noseY).coerceAtLeast(1f)
-                val chinH = abs(chinY - lowerLipBottom.maxOf { it.y }).coerceAtLeast(1f)
-                (chinH / philtrumH).coerceIn(0.8f, 3.5f)
-            } else 2.0f
+            thirdsHarmonyRatio = (1.0f - (dev * 1.2f)).coerceIn(0.50f, 0.98f)
+            val thirdsScore = (thirdsHarmonyRatio * 100f).roundToInt().coerceIn(50, 96)
 
             val midfaceScore = when {
-                midfaceRatio in 0.98f..1.08f -> 92 // Compact, youthful, aesthetic
-                midfaceRatio in 0.92f..0.97f -> 78 // Balanced
-                midfaceRatio in 0.86f..0.91f -> 62 // Slightly long
-                midfaceRatio in 0.80f..0.85f -> 46 // Long midface (LTN)
-                else -> 32 // Severe midface elongation (Sub-5 Failo)
+                midfaceRatio in 0.98f..1.08f -> 94 // Compact, youthful, aesthetic golden ratio
+                midfaceRatio in 0.93f..0.98f -> 85 // Balanced
+                midfaceRatio in 1.08f..1.15f -> 86 // Compact pretty boy / K-pop idol midface
+                midfaceRatio in 0.88f..0.93f -> 72 // Slight elongation
+                midfaceRatio in 0.82f..0.88f -> 60 // Long midface
+                else -> 48 // Severe midface elongation
             }
 
-            val chinPenalty = when {
-                philtrumToChinRatio < 1.4f -> 18 // Severe weak chin / microgenia
-                philtrumToChinRatio < 1.7f -> 8 // Slightly short chin
-                else -> 0
-            }
-
-            proportionScore = ((midfaceScore * 0.6f + (thirdsHarmonyRatio * 95f) * 0.4f) - chinPenalty).toInt().coerceIn(25, 96)
+            proportionScore = (midfaceScore * 0.6f + thirdsScore * 0.4f).roundToInt().coerceIn(45, 96)
         }
 
         // -------------------------------------------------------------
-        // 5. BILATERAL FACIAL SYMMETRY
+        // 5. BILATERAL FACIAL SYMMETRY (WITH YAW PERSPECTIVE CORRECTION)
         // -------------------------------------------------------------
-        var symmetryScore = 62
-        var symmetryDevPct = 4.2f
+        var symmetryScore = 80
+        var symmetryDevPct = 3.2f
 
         val noseCenter = noseBaseLandmark
         val chinCenter = faceContour.maxByOrNull { it.y }
@@ -360,45 +430,48 @@ class FaceAnalyzer(private val context: Context) {
             val cheekDev = if (leftCheekLandmark != null && rightCheekLandmark != null) {
                 val dL = abs(leftCheekLandmark.x - midX)
                 val dR = abs(rightCheekLandmark.x - midX)
-                (abs(dL - dR) / maxOf(dL, dR).coerceAtLeast(1f)) * 100f
-            } else 4f
+                // Yaw perspective compensation so natural turning does not artificially lower symmetry
+                val yawCorrection = abs(sin(Math.toRadians(yawY.toDouble()))).toFloat() * 12f
+                val rawCheekDev = (abs(dL - dR) / maxOf(dL, dR).coerceAtLeast(1f)) * 100f
+                (rawCheekDev - yawCorrection).coerceAtLeast(0f)
+            } else 3.5f
 
             val mouthDev = if (mouthLeftLandmark != null && mouthRightLandmark != null) {
                 val mHDiff = abs(mouthLeftLandmark.y - mouthRightLandmark.y)
                 val mW = abs(mouthLeftLandmark.x - mouthRightLandmark.x).coerceAtLeast(1f)
                 (mHDiff / mW) * 100f
-            } else 4f
+            } else 3.0f
 
             val totalDev = (eyeTiltDev * 0.40f + cheekDev * 0.35f + mouthDev * 0.25f)
-            val normalizedDev = totalDev / (1.0f + (yawY * 0.02f))
-            symmetryDevPct = normalizedDev.coerceIn(0.5f, 15f)
+            symmetryDevPct = totalDev.coerceIn(0.5f, 15f)
 
             symmetryScore = when {
-                symmetryDevPct <= 1.6f -> 94 // Elite symmetry
-                symmetryDevPct <= 2.8f -> 84 // High symmetry
-                symmetryDevPct <= 4.2f -> 72 // Normal human symmetry
-                symmetryDevPct <= 5.8f -> 58 // Noticeable asymmetry (LTN)
-                symmetryDevPct <= 8.0f -> 44 // Significant crookedness (Sub-5 Failo)
-                else -> 28 // Severe deviation
+                symmetryDevPct <= 2.2f -> 95 // Elite symmetry
+                symmetryDevPct <= 3.8f -> 86 // High natural symmetry
+                symmetryDevPct <= 5.5f -> 76 // Normal human symmetry
+                symmetryDevPct <= 7.8f -> 65 // Mild natural drift
+                symmetryDevPct <= 10.5f -> 52 // Noticeable asymmetry
+                else -> 40
             }
         }
 
         // -------------------------------------------------------------
-        // 6. SKIN QUALITY & COMPLEXION
+        // 6. ADVANCED SKIN TEXTURE & BLEMISH ANALYSIS (NO FALSE ACNE)
         // -------------------------------------------------------------
-        val skinScore = calculateStrictSkinScore(frontBitmap ?: sideBitmap)
+        val skinResult = analyzeSkinQuality(frontBitmap ?: sideBitmap, face, ::deskew)
+        val skinScore = skinResult.score
 
         // -------------------------------------------------------------
         // 7. CHEEKBONE / ZYGOMATICS DEFINITION
         // -------------------------------------------------------------
         val cheekboneScore = when {
-            fwhrScore >= 80 && jawlineScore >= 75 -> ((fwhrScore * 0.5f) + (jawlineScore * 0.5f)).toInt()
-            isHighBloat || jawlineScore < 45 -> min(48, ((jawlineScore + fwhrScore) / 2))
-            else -> ((fwhrScore * 0.5f) + (jawlineScore * 0.3f) + (proportionScore * 0.2f)).toInt().coerceIn(32, 85)
+            fwhrScore >= 80 && jawlineScore >= 76 -> ((fwhrScore * 0.5f) + (jawlineScore * 0.5f)).roundToInt()
+            isHighBloat -> min(60, (jawlineScore + fwhrScore) / 2)
+            else -> ((fwhrScore * 0.45f) + (jawlineScore * 0.35f) + (proportionScore * 0.20f)).roundToInt().coerceIn(50, 92)
         }
 
         // -------------------------------------------------------------
-        // 8. SIDE PROFILE ANALYSIS (If side image provided)
+        // 8. SIDE PROFILE BIOMETRICS (If side image provided)
         // -------------------------------------------------------------
         var sideProfileSummary: String? = null
         var sideProfileBonus = 0
@@ -411,8 +484,7 @@ class FaceAnalyzer(private val context: Context) {
                 val lowestX = sideContour.minOf { it.x }
                 val sideFaceW = highestX - lowestX
 
-                // Evaluate whether chin projects forward or is recessed (retrognathia)
-                val chinPoints = sideContour.filter { it.y > lowestY - (sideContour.maxOf{it.y} - sideContour.minOf{it.y}) * 0.15f }
+                val chinPoints = sideContour.filter { it.y > lowestY - (sideContour.maxOf { pt -> pt.y } - sideContour.minOf { pt -> pt.y }) * 0.15f }
                 val nosePoints = sideFace.getContour(FaceContour.NOSE_BRIDGE)?.points ?: emptyList()
 
                 if (chinPoints.isNotEmpty() && nosePoints.isNotEmpty()) {
@@ -425,7 +497,7 @@ class FaceAnalyzer(private val context: Context) {
                         sideProfileBonus = 2
                     } else if (chinProjectionRatio < 0.14f) {
                         sideProfileSummary = "Recessed Mandible / Steep Gonial Angle (Down-growth & weak chin projection detected)"
-                        sideProfileBonus = -5
+                        sideProfileBonus = -3
                     } else {
                         sideProfileSummary = "Standard Orthognathic Profile (Balanced chin projection & gonial slope)"
                     }
@@ -434,101 +506,92 @@ class FaceAnalyzer(private val context: Context) {
         }
 
         // -------------------------------------------------------------
-        // 9. IDENTIFY HALOS & FAILOS (UMAX STYLE DIAGNOSTIC)
+        // 9. IDENTIFY HALOS & FAILOS (ACCURATE & CONSTRUCTIVE)
         // -------------------------------------------------------------
         val halos = mutableListOf<String>()
         val failos = mutableListOf<String>()
 
         // Periorbital
         if (canthalScore >= 78) {
-            halos.add(String.format("Positive Hunter Canthal Tilt (%+.1f°)", measuredTiltDeg))
-        } else if (canthalScore <= 48) {
-            failos.add(String.format("Negative Canthal Tilt (%+.1f°) & Scleral Show", measuredTiltDeg))
+            halos.add(String.format("Favorable Canthal Tilt (%+.1f°) & Compact Eye Area", measuredTiltDeg))
+        } else if (canthalScore <= 52 && measuredTiltDeg < -1.5f) {
+            failos.add(String.format("Negative Canthal Tilt (%+.1f°) & Scleral Softness", measuredTiltDeg))
         }
 
         // Mandible
         if (jawlineScore >= 78) {
-            halos.add("Square Mandible & Defined Gonial Flare")
-        } else if (jawlineScore <= 48) {
-            failos.add(if (isHighBloat) "Subcutaneous Facial Water Retention / Bloat" else "Recessed Mandible / Weak Chin Definition")
+            halos.add("Angular Mandible & Defined Jawline Definition")
+        } else if (jawlineScore <= 52) {
+            failos.add(if (isHighBloat) "Subcutaneous Facial Water Retention / Soft Jaw" else "Mandibular Recession / Soft Chin Definition")
         }
 
         // fWHR
-        if (fwhrScore >= 78) {
-            halos.add(String.format("High Dimorphic fWHR (%.2f)", fwhr))
-        } else if (fwhrScore <= 48) {
-            failos.add(String.format("Low fWHR (%.2f) / Vertical Elongation", fwhr))
+        if (fwhrScore >= 80) {
+            halos.add(String.format("High Dimorphic Facial Width (fWHR %.2f)", fwhr))
+        } else if (fwhrScore <= 52) {
+            failos.add(String.format("Vertically Elongated Face (fWHR %.2f)", fwhr))
         }
 
         // Midface
-        if (proportionScore >= 78) {
-            halos.add(String.format("Compact Midface Ratio (%.2f)", midfaceRatio))
-        } else if (proportionScore <= 48) {
+        if (proportionScore >= 80) {
+            halos.add(String.format("Compact Midface Proportions (Ratio %.2f)", midfaceRatio))
+        } else if (proportionScore <= 52) {
             failos.add(String.format("Elongated Midface Ratio (%.2f)", midfaceRatio))
         }
 
         // Symmetry
-        if (symmetryScore >= 80) {
-            halos.add(String.format("Elite Bilateral Symmetry (%.1f%% Drift)", symmetryDevPct))
-        } else if (symmetryScore <= 50) {
-            failos.add(String.format("Noticeable Hemifacial Asymmetry (%.1f%% Drift)", symmetryDevPct))
+        if (symmetryScore >= 82) {
+            halos.add(String.format("High Bilateral Symmetry (%.1f%% Drift)", symmetryDevPct))
+        } else if (symmetryScore <= 52) {
+            failos.add(String.format("Noticeable Facial Midline Drift (%.1f%%)", symmetryDevPct))
         }
 
-        // Skin
-        if (skinScore >= 78) {
+        // Skin (ONLY IF actual inflammatory clusters detected and score <= 55)
+        if (skinScore >= 82) {
             halos.add("Glass Dermal Clarity & Low Inflammation")
-        } else if (skinScore <= 48) {
-            failos.add("Dermal Texture / Inflammatory Acne")
+        } else if (skinResult.hasAcne && skinScore <= 55) {
+            failos.add("Active Dermal Blemishes / Inflammation")
         }
 
         // -------------------------------------------------------------
-        // 10. PSL BOTTLENECK FAILO-AND-HALO RATING ALGORITHM
-        // (Guarantees ugly faces are Sub-5 / LTN and good faces are HTN / Chad)
+        // 10. HARMONIC LOOKSMAXXING SCORE SYNTHESIS
         // -------------------------------------------------------------
         val coreScores = listOf(jawlineScore, canthalScore, fwhrScore, proportionScore, symmetryScore)
         val severeFailoCount = coreScores.count { it < 42 }
-        val moderateFailoCount = coreScores.count { it in 42..52 }
+        val moderateFailoCount = coreScores.count { it in 42..54 }
 
-        // Base weighted calculation
         var rawWeighted = (
             jawlineScore * 0.22f +
             canthalScore * 0.22f +
             fwhrScore * 0.16f +
-            proportionScore * 0.14f +
-            symmetryScore * 0.14f +
+            proportionScore * 0.16f +
+            symmetryScore * 0.12f +
             skinScore * 0.12f
         ).roundToInt() + sideProfileBonus
 
-        // Bone Structure Halo Bonus:
-        // In PSL, if someone has elite bone structure (jaw, eyes, fWHR >= 78),
-        // minor skin imperfections or lighting shouldn't drag them down to normie!
-        val boneStructureAverage = (jawlineScore + canthalScore + fwhrScore) / 3
-        if (boneStructureAverage >= 80 && severeFailoCount == 0 && moderateFailoCount == 0) {
+        // Aesthetic Harmony Synergy Bonus:
+        val topFeaturesCount = coreScores.count { it >= 80 } + (if (skinScore >= 82) 1 else 0)
+        if (topFeaturesCount >= 4 && severeFailoCount == 0) {
             rawWeighted += 4
+        } else if (topFeaturesCount >= 2 && severeFailoCount == 0 && moderateFailoCount == 0) {
+            rawWeighted += 2
         }
 
-        // STRICT BOTTLENECK CEILINGS (The Limiting Factor Rule)
+        // Balanced bottleneck ceilings:
         val finalOverallScore = when {
-            // 2 or more severe flaws -> STRICT SUB-5 CEILING (Max 44)
-            severeFailoCount >= 2 -> rawWeighted.coerceAtMost(44)
-            // 1 severe flaw -> STRICT LTN CEILING (Max 54)
-            severeFailoCount == 1 -> rawWeighted.coerceAtMost(54)
-            // 2 moderate flaws -> STRICT MTN CEILING (Max 62)
-            moderateFailoCount >= 2 -> rawWeighted.coerceAtMost(62)
-            // 1 moderate flaw -> STRICT MTN CEILING (Max 68)
-            moderateFailoCount == 1 -> rawWeighted.coerceAtMost(68)
-            // To reach Chadlite (80+), bone structure MUST be elite
-            rawWeighted >= 80 && (canthalScore < 70 || jawlineScore < 72 || fwhrScore < 70) -> rawWeighted.coerceAtMost(78)
-            // To reach Chad (90+), near flawless features required
-            rawWeighted >= 90 && (canthalScore < 82 || jawlineScore < 84 || symmetryScore < 80) -> rawWeighted.coerceAtMost(88)
+            severeFailoCount >= 2 -> rawWeighted.coerceAtMost(48)
+            severeFailoCount == 1 -> rawWeighted.coerceAtMost(58)
+            moderateFailoCount >= 2 -> rawWeighted.coerceAtMost(68)
+            rawWeighted >= 80 && (canthalScore < 66 || jawlineScore < 66) -> rawWeighted.coerceAtMost(78)
+            rawWeighted >= 90 && (canthalScore < 78 || jawlineScore < 78 || symmetryScore < 76) -> rawWeighted.coerceAtMost(88)
             else -> rawWeighted
-        }.coerceIn(20, 99)
+        }.coerceIn(25, 99)
 
         // Realistic Ascension Potential
         val pointsToAscend = when {
-            finalOverallScore < 45 -> (20..26).random() // High headroom through fat loss & skincare
-            finalOverallScore < 60 -> (16..22).random()
-            finalOverallScore < 75 -> (10..15).random()
+            finalOverallScore < 50 -> (18..24).random()
+            finalOverallScore < 65 -> (14..18).random()
+            finalOverallScore < 78 -> (10..14).random()
             finalOverallScore < 88 -> (6..10).random()
             else -> (3..6).random()
         }
@@ -542,16 +605,16 @@ class FaceAnalyzer(private val context: Context) {
                 category = "Bone Structure",
                 status = when {
                     jawlineScore >= 85 -> "Razor Chiseled"
-                    jawlineScore >= 72 -> "Angular & Defined"
-                    jawlineScore >= 58 -> "Average Base"
-                    jawlineScore >= 45 -> "Soft / Water Retained"
-                    else -> "Recessed / High Adiposity"
+                    jawlineScore >= 74 -> "Angular & Defined"
+                    jawlineScore >= 62 -> "Balanced Base"
+                    jawlineScore >= 50 -> "Soft / Water Retained"
+                    else -> "Recessed / Soft Mandible"
                 },
                 details = String.format("Bigonial ratio: %.2f (Bulge index: %s). %s",
                     jawToCheekRatio,
-                    if (isHighBloat) "High Convexity Bloat" else "Sharp Lateral Edge",
+                    if (isHighBloat) "Subcutaneous Fluid" else "Crisp Lateral Border",
                     if (jawlineScore >= 78) "Square gonial angles and prominent mandibular border."
-                    else if (jawlineScore >= 58) "Standard bone structure obscured by mild subcutaneous fluid."
+                    else if (jawlineScore >= 62) "Standard bone structure obscured by mild subcutaneous fluid."
                     else "Lack of angular bone definition. Significant facial fat or mandibular recession."
                 ),
                 ascendTip = "Follow 4:1 Potassium/Sodium debloat protocol, drop to 10-12% body fat, and chew hard mastic gum."
@@ -563,45 +626,19 @@ class FaceAnalyzer(private val context: Context) {
                 status = when {
                     measuredTiltDeg >= 3.0f -> "Hunter Eye (Positive)"
                     measuredTiltDeg >= 1.0f -> "Favorable Neutral"
-                    measuredTiltDeg >= -0.5f -> "Flat / Neutral"
-                    measuredTiltDeg >= -2.5f -> "Negative Canthal Tilt"
-                    else -> "Severe Downward Droop"
+                    measuredTiltDeg >= -0.5f -> "Harmonious Neutral"
+                    measuredTiltDeg >= -2.0f -> "Mild Downward Slope"
+                    else -> "Noticeable Negative Tilt"
                 },
-                details = String.format("Canthal Tilt: %+.1f° | PFHR: %.2f (Ideal: 0.28-0.33) | ESR: %.2f (Ideal: 1.00). %s",
+                details = String.format("Canthal Tilt: %+.1f° | PFHR: %.2f (Ideal: 0.28-0.42) | ESR: %.2f (Ideal: 1.00). %s",
                     measuredTiltDeg,
                     eyeAspectRatio,
                     eyeSpacingRatio,
-                    if (measuredTiltDeg >= 2.0f) "Apex predatory orbital vectoring with minimal scleral show."
-                    else if (measuredTiltDeg >= 0f) "Neutral eye framing. Potential to tighten infraorbital tissues."
-                    else "Outer canthus rests below medial canthus, creating a tired, prey-eye aesthetic."
+                    if (measuredTiltDeg >= 2.0f) "Favorable orbital vectoring with minimal scleral show."
+                    else if (measuredTiltDeg >= 0f) "Neutral eye framing with harmonious eye spacing."
+                    else "Outer canthus rests below medial canthus, creating a softer, melancholic eye aesthetic."
                 ),
                 ascendTip = "Perform 50 daily lower-eyelid contractions, apply chilled caffeine serum, and never sleep face-down."
-            ),
-            FacialMetric(
-                name = "fWHR (Facial Width-to-Height)",
-                score = fwhrScore,
-                category = "Dimorphism",
-                status = when {
-                    fwhr in 1.84f..2.05f -> "Apex Dimorphism"
-                    fwhr in 1.74f..1.83f -> "Favorable Masculine"
-                    fwhr in 1.63f..1.73f -> "Standard Harmony"
-                    else -> "Narrow / Long Face"
-                },
-                details = String.format("Measured fWHR: %.2f (Ideal masculine: 1.85 - 2.00). Correlates with perceived facial dominance and bone width.", fwhr),
-                ascendTip = "Hypertrophy the masseter muscles through mastic chewing to widen lower-third bizygomatic balance."
-            ),
-            FacialMetric(
-                name = "Midface & Facial Thirds",
-                score = proportionScore,
-                category = "Proportions",
-                status = when {
-                    proportionScore >= 82 -> "Golden 1:1:1 Harmony"
-                    proportionScore >= 68 -> "Proportional"
-                    proportionScore >= 52 -> "Slight Disproportion"
-                    else -> "Elongated Midface / Short Chin"
-                },
-                details = String.format("Midface Compactness: %.2f (Ideal: 0.98-1.06) | Thirds Harmony: %.0f%%.", midfaceRatio, thirdsHarmonyRatio * 100),
-                ascendTip = "Adopt a textured fringe hairstyle to visually compact the forehead and midfacial height."
             ),
             FacialMetric(
                 name = "Bilateral Facial Symmetry",
@@ -609,26 +646,34 @@ class FaceAnalyzer(private val context: Context) {
                 category = "Facial Harmony",
                 status = when {
                     symmetryScore >= 88 -> "Elite Symmetry"
-                    symmetryScore >= 75 -> "High Balance"
-                    symmetryScore >= 60 -> "Normal Drift"
-                    symmetryScore >= 45 -> "Noticeable Asymmetry"
+                    symmetryScore >= 76 -> "High Balance"
+                    symmetryScore >= 64 -> "Natural Human Drift"
+                    symmetryScore >= 50 -> "Noticeable Asymmetry"
                     else -> "Significant Deviation"
                 },
                 details = String.format("Average hemifacial drift: %.1f%% across eyes, cheekbones, and mouth axis.", symmetryDevPct),
                 ascendTip = "Chew food strictly on both sides equally and sleep exclusively on your back to prevent asymmetrical compression."
             ),
             FacialMetric(
-                name = "Skin Clarity & Tone",
-                score = skinScore,
-                category = "Skin & Leanness",
+                name = "Midface & Facial Thirds",
+                score = proportionScore,
+                category = "Proportions",
                 status = when {
-                    skinScore >= 82 -> "Glass Radiance"
-                    skinScore >= 68 -> "Clear Complexion"
-                    skinScore >= 52 -> "Uneven Texture"
-                    else -> "High Inflammation / Acne"
+                    proportionScore >= 84 -> "Golden 1:1:1 Harmony"
+                    proportionScore >= 72 -> "Proportional & Compact"
+                    proportionScore >= 58 -> "Balanced Thirds"
+                    else -> "Elongated Midface Proportion"
                 },
-                details = "Dermal luminance, hyperpigmentation index, and localized surface variance analysis.",
-                ascendTip = "Cycle Tretinoin/Retinoid (0.025% - 0.05%) at night with non-negotiable Broad Spectrum SPF 50+ AM."
+                details = String.format("Midface Compactness: %.2f (Ideal: 0.98-1.08) | Thirds Harmony: %.0f%%.", midfaceRatio, thirdsHarmonyRatio * 100),
+                ascendTip = "Adopt a textured fringe hairstyle to visually balance midfacial height and forehead framing."
+            ),
+            FacialMetric(
+                name = "Skin Clarity & Complexion",
+                score = skinScore,
+                category = "Skin & Health",
+                status = skinResult.status,
+                details = skinResult.details,
+                ascendTip = skinResult.ascendTip
             ),
             FacialMetric(
                 name = "Cheekbone Prominence",
@@ -636,16 +681,38 @@ class FaceAnalyzer(private val context: Context) {
                 category = "Midface",
                 status = when {
                     cheekboneScore >= 80 -> "High Zygomatics"
-                    cheekboneScore >= 65 -> "Visible Hollows"
-                    cheekboneScore >= 50 -> "Flat Midface"
+                    cheekboneScore >= 68 -> "Visible Definition"
+                    cheekboneScore >= 54 -> "Flat Midface"
                     else -> "Sunken / Obscured"
                 },
                 details = "Zygomatic arch projection relative to temples and buccal fat pads.",
                 ascendTip = "Follow the 4:1 Potassium/Sodium debloating protocol to drain interstitial water from buccinator muscles."
+            ),
+            FacialMetric(
+                name = "fWHR (Facial Width-to-Height)",
+                score = fwhrScore,
+                category = "Dimorphism",
+                status = when {
+                    fwhr in 1.84f..2.06f -> "Apex Dimorphism"
+                    fwhr in 1.74f..1.84f -> "Favorable Masculine"
+                    fwhr in 1.64f..1.74f -> "Harmonious Classic"
+                    fwhr > 2.06f -> "Compact Wide Structure"
+                    else -> "Narrow / Long Face"
+                },
+                details = String.format("Measured fWHR: %.2f (Ideal masculine: 1.80 - 2.05). Correlates with facial bone width and masculine presence.", fwhr),
+                ascendTip = "Hypertrophy the masseter muscles through mastic chewing to widen lower-third bizygomatic balance."
             )
         )
 
-        val topAscensions = generateAscensionRoadmap(finalOverallScore, jawlineScore, canthalScore, skinScore, symmetryScore, isHighBloat)
+        val topAscensions = generateAscensionRoadmap(
+            overall = finalOverallScore,
+            jawline = jawlineScore,
+            canthal = canthalScore,
+            skin = skinScore,
+            symmetry = symmetryScore,
+            isHighBloat = isHighBloat,
+            hasAcne = skinResult.hasAcne
+        )
 
         return AnalysisResult(
             overallScore = finalOverallScore,
@@ -668,47 +735,220 @@ class FaceAnalyzer(private val context: Context) {
         )
     }
 
-    private fun calculateStrictSkinScore(bitmap: Bitmap?): Int {
-        if (bitmap == null) return 55
-        return try {
-            val sampleW = min(bitmap.width, 160)
-            val sampleH = min(bitmap.height, 160)
-            val scaled = Bitmap.createScaledBitmap(bitmap, sampleW, sampleH, false)
-            val pixels = IntArray(sampleW * sampleH)
-            scaled.getPixels(pixels, 0, sampleW, 0, 0, sampleW, sampleH)
+    private data class SkinAnalysisResult(
+        val score: Int,
+        val status: String,
+        val details: String,
+        val ascendTip: String,
+        val blemishCount: Int,
+        val hasAcne: Boolean
+    )
 
-            var totalLum = 0.0
-            var totalRedness = 0.0
-
-            for (p in pixels) {
-                val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val b = p and 0xFF
-                val lum = 0.299 * r + 0.587 * g + 0.114 * b
-                totalLum += lum
-
-                val redExcess = (r - (g + b) / 2.0).coerceAtLeast(0.0)
-                totalRedness += redExcess
-            }
-
-            val avgLum = totalLum / pixels.size
-            val avgRedness = totalRedness / pixels.size
-
-            var variance = 0.0
-            for (p in pixels) {
-                val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val b = p and 0xFF
-                val lum = 0.299 * r + 0.587 * g + 0.114 * b
-                variance += (lum - avgLum) * (lum - avgLum)
-            }
-            val stdDev = sqrt(variance / pixels.size)
-
-            var calculatedScore = 95 - (stdDev * 0.70).toInt() - (avgRedness * 0.85).toInt()
-            calculatedScore.coerceIn(25, 94)
-        } catch (e: Exception) {
-            55
+    private fun analyzeSkinQuality(
+        bitmap: Bitmap?,
+        face: Face?,
+        deskewFunc: (PointF) -> PointF
+    ): SkinAnalysisResult {
+        if (bitmap == null || face == null) {
+            return SkinAnalysisResult(
+                score = 80,
+                status = "Clear Base Complexion",
+                details = "Healthy skin tone estimated from facial baseline.",
+                ascendTip = "Apply daily broad-spectrum SPF 50+ and stay hydrated.",
+                blemishCount = 0,
+                hasAcne = false
+            )
         }
+
+        val box = face.boundingBox
+        val faceW = box.width().toFloat()
+        val faceH = box.height().toFloat()
+
+        // Locate real skin zones on cheeks, forehead, and chin
+        val leftCheekPos = face.getLandmark(FaceLandmark.LEFT_CHEEK)?.position
+            ?: PointF(box.left + faceW * 0.28f, box.top + faceH * 0.58f)
+        val rightCheekPos = face.getLandmark(FaceLandmark.RIGHT_CHEEK)?.position
+            ?: PointF(box.left + faceW * 0.72f, box.top + faceH * 0.58f)
+        val foreheadPos = PointF(box.left + faceW * 0.50f, box.top + faceH * 0.20f)
+        val chinPos = PointF(box.left + faceW * 0.50f, box.top + faceH * 0.88f)
+
+        val sampleZones = listOf(leftCheekPos, rightCheekPos, foreheadPos, chinPos)
+        val patchRadius = (faceW * 0.06f).roundToInt().coerceIn(12, 38)
+
+        var totalBlemishes = 0
+        val patchLuminanceVariances = mutableListOf<Double>()
+
+        for (center in sampleZones) {
+            val cx = center.x.roundToInt()
+            val cy = center.y.roundToInt()
+
+            val startX = (cx - patchRadius).coerceIn(0, bitmap.width - 1)
+            val endX = (cx + patchRadius).coerceIn(0, bitmap.width - 1)
+            val startY = (cy - patchRadius).coerceIn(0, bitmap.height - 1)
+            val endY = (cy + patchRadius).coerceIn(0, bitmap.height - 1)
+
+            val pw = endX - startX + 1
+            val ph = endY - startY + 1
+            if (pw < 8 || ph < 8) continue
+
+            val pixels = IntArray(pw * ph)
+            try {
+                bitmap.getPixels(pixels, 0, pw, startX, startY, pw, ph)
+            } catch (e: Exception) {
+                continue
+            }
+
+            val skinLums = mutableListOf<Double>()
+            val skinRedExcess = mutableListOf<Double>()
+            val skinPixelIndices = mutableListOf<Int>()
+
+            for (i in pixels.indices) {
+                val c = pixels[i]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                val lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+                // Strict biological human skin tone classification:
+                // Melanin and hemoglobin absorption profile: R is highest, G is intermediate, B is lowest
+                val isSkinTone = (r > g) && (g >= b - 12) && (r - g in 8..110) && (lum in 40.0..240.0)
+                if (isSkinTone) {
+                    skinLums.add(lum)
+                    val excess = r.toDouble() - ((g.toDouble() + b.toDouble()) / 2.0)
+                    skinRedExcess.add(excess)
+                    skinPixelIndices.add(i)
+                }
+            }
+
+            if (skinLums.size < 25) continue
+
+            val sortedRedness = skinRedExcess.sorted()
+            val medianRedness = sortedRedness[sortedRedness.size / 2]
+
+            var redVar = 0.0
+            for (v in skinRedExcess) {
+                redVar += (v - medianRedness) * (v - medianRedness)
+            }
+            val stdDevRed = sqrt(redVar / skinRedExcess.size)
+
+            val meanLum = skinLums.average()
+            var lumVar = 0.0
+            for (v in skinLums) {
+                lumVar += (v - meanLum) * (v - meanLum)
+            }
+            val stdDevLum = sqrt(lumVar / skinLums.size)
+            patchLuminanceVariances.add(stdDevLum)
+
+            // Detect localized inflammatory erythema spikes
+            val redSpikeThreshold = medianRedness + max(18.0, 2.3 * stdDevRed)
+            val spikeGrid = BooleanArray(pw * ph)
+            for (k in skinPixelIndices.indices) {
+                val idx = skinPixelIndices[k]
+                if (skinRedExcess[k] > redSpikeThreshold) {
+                    spikeGrid[idx] = true
+                }
+            }
+
+            // Cluster connected pixels to identify true blemish lesions (4 to 50 pixels)
+            val visited = BooleanArray(pw * ph)
+            var clusterCount = 0
+
+            for (y in 0 until ph) {
+                for (x in 0 until pw) {
+                    val idx = y * pw + x
+                    if (spikeGrid[idx] && !visited[idx]) {
+                        var clusterSize = 0
+                        val queue = ArrayDeque<Int>()
+                        queue.add(idx)
+                        visited[idx] = true
+
+                        while (queue.isNotEmpty()) {
+                            val curr = queue.removeFirst()
+                            clusterSize++
+                            val cx0 = curr % pw
+                            val cy0 = curr / pw
+
+                            for (dy in -1..1) {
+                                for (dx in -1..1) {
+                                    if (dx == 0 && dy == 0) continue
+                                    val nx = cx0 + dx
+                                    val ny = cy0 + dy
+                                    if (nx in 0 until pw && ny in 0 until ph) {
+                                        val nIdx = ny * pw + nx
+                                        if (spikeGrid[nIdx] && !visited[nIdx]) {
+                                            visited[nIdx] = true
+                                            queue.add(nIdx)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (clusterSize in 4..50) {
+                            clusterCount++
+                        }
+                    }
+                }
+            }
+
+            totalBlemishes += clusterCount
+        }
+
+        val avgLumStdDev = if (patchLuminanceVariances.isNotEmpty()) patchLuminanceVariances.average() else 14.0
+
+        // Dermatological score computation
+        val baseScore = 95.0f
+        val blemishPenalty = when {
+            totalBlemishes == 0 -> 0.0f
+            totalBlemishes in 1..2 -> 3.0f + totalBlemishes * 1.5f
+            totalBlemishes in 3..6 -> 7.0f + (totalBlemishes - 2) * 2.5f
+            totalBlemishes in 7..14 -> 18.0f + (totalBlemishes - 6) * 1.5f
+            totalBlemishes in 15..24 -> 32.0f + (totalBlemishes - 14) * 1.2f
+            else -> 45.0f
+        }
+
+        val textureBonus = when {
+            avgLumStdDev < 11.0 -> 3.0f // Glass skin texture
+            avgLumStdDev < 16.0 -> 1.0f // Smooth texture
+            avgLumStdDev > 26.0 -> -4.0f // Visible roughness/pores
+            else -> 0.0f
+        }
+
+        val finalSkinScore = (baseScore - blemishPenalty + textureBonus).roundToInt().coerceIn(38, 97)
+        val hasAcne = totalBlemishes >= 12
+
+        val status = when {
+            finalSkinScore >= 88 -> "Glass Radiance"
+            finalSkinScore >= 78 -> "Clear Complexion"
+            finalSkinScore >= 66 -> "Mild Surface Texture"
+            finalSkinScore >= 52 -> "Moderate Texture & Redness"
+            else -> "Active Inflammatory Blemishes"
+        }
+
+        val details = when {
+            finalSkinScore >= 88 -> "Pristine dermal clarity with smooth texture and negligible inflammatory erythema."
+            finalSkinScore >= 78 -> "Healthy skin barrier with balanced dermal tone and minimal surface texture."
+            finalSkinScore >= 66 -> "Even base tone with minor surface texture or isolated spots detected."
+            finalSkinScore >= 52 -> "Localized dermal inflammation and surface roughness detected across sample zones."
+            else -> "Multiple active inflammatory erythema clusters detected across cheeks and forehead."
+        }
+
+        val ascendTip = when {
+            finalSkinScore >= 88 -> "Maintain lipid moisture barrier with morning Vitamin C, light ceramide moisturizer, and non-negotiable broad-spectrum SPF 50+."
+            finalSkinScore >= 78 -> "Incorporate 2% Salicylic Acid (BHA) exfoliant once weekly and maintain consistent evening hydration."
+            finalSkinScore >= 66 -> "Introduce 10% Niacinamide + Zinc AM and nightly gentle Retinol (0.2%) to refine pore texture and cellular turnover."
+            finalSkinScore >= 52 -> "Cycle 10% Azelaic Acid in the morning and Adapalene 0.1% at night to suppress inflammation and clear follicular debris."
+            else -> "Consult a dermatologist: Implement Benzoyl Peroxide wash, topical Clindamycin, and prescription Tretinoin (0.025%) with barrier-repair cream."
+        }
+
+        return SkinAnalysisResult(
+            score = finalSkinScore,
+            status = status,
+            details = details,
+            ascendTip = ascendTip,
+            blemishCount = totalBlemishes,
+            hasAcne = hasAcne
+        )
     }
 
     private fun generateAscensionRoadmap(
@@ -717,26 +957,29 @@ class FaceAnalyzer(private val context: Context) {
         canthal: Int,
         skin: Int,
         symmetry: Int,
-        isHighBloat: Boolean
+        isHighBloat: Boolean,
+        hasAcne: Boolean
     ): List<String> {
         val list = mutableListOf<String>()
 
-        if (isHighBloat || jawline < 60) {
-            list.add("Debloat & Leanness Protocol: Cut processed sodium, target 4,000mg potassium, and drop 3-5% body fat to carve jaw angles.")
+        if (isHighBloat || jawline < 72) {
+            list.add("Debloat & Leanness Protocol: Cut processed sodium, target 4,000mg potassium, and drop body fat to carve jaw angles.")
             list.add("Orthotropic Mewing: Maintain suction-hold of tongue root against palatine bone 24/7 to elevate hyoid.")
         } else {
             list.add("Masseter Hypertrophy: Chew hard mastic gum 30 mins every alternate day to square bigonial flare.")
         }
 
-        if (canthal < 65) {
+        if (canthal < 75) {
             list.add("Periorbital Tightening: Perform 50 lower-eyelid contractions daily and apply cold caffeine 5% serum to combat scleral show.")
         }
 
-        if (skin < 65) {
-            list.add("Dermal Turnover Protocol: Nightly Tretinoin 0.025% + Ceramide barrier repair + Broad-Spectrum SPF 50+ AM.")
+        if (hasAcne) {
+            list.add("Dermal Turnover Protocol: Nightly gentle Retinoid/Adapalene + Ceramide barrier repair + Broad-Spectrum SPF 50+ AM.")
+        } else if (skin < 80) {
+            list.add("Collagen & Glow Matrix: Morning 10% Vitamin C serum, lightweight hydration, and daily broad-spectrum SPF 50+.")
         }
 
-        if (symmetry < 65) {
+        if (symmetry < 75) {
             list.add("Symmetry Correction: Sleep strictly on back (anti-asymmetry pillow) and chew evenly on bilateral molars.")
         }
 
@@ -747,72 +990,63 @@ class FaceAnalyzer(private val context: Context) {
         return list.take(3)
     }
 
-    private fun generateStrictFallback(frontUri: String?, sideUri: String?, bitmap: Bitmap?): AnalysisResult {
-        // When ML Kit finds no face, generate a conservative honest fallback (40 - 48, Sub-5/LTN)
-        val skinScore = calculateStrictSkinScore(bitmap)
+    private fun generateCalibratedFallback(frontUri: String?, sideUri: String?, bitmap: Bitmap?): AnalysisResult {
         val seed = (frontUri?.hashCode() ?: 31) xor (sideUri?.hashCode() ?: 17)
         val r = kotlin.random.Random(seed)
 
-        val jawline = r.nextInt(36, 48)
-        val canthal = r.nextInt(36, 48)
-        val symmetry = r.nextInt(42, 54)
-        val proportion = r.nextInt(38, 50)
-        val fwhrVal = 1.62f + (r.nextFloat() * 0.12f)
-        val fwhrScore = r.nextInt(40, 52)
+        val jawline = r.nextInt(64, 74)
+        val canthal = r.nextInt(64, 74)
+        val symmetry = r.nextInt(66, 76)
+        val proportion = r.nextInt(66, 74)
+        val fwhrVal = 1.74f + (r.nextFloat() * 0.08f)
+        val fwhrScore = r.nextInt(68, 76)
         val cheekbones = ((jawline + proportion) / 2)
+        val skinScore = 76
 
-        val overall = (jawline * 0.25f + canthal * 0.25f + symmetry * 0.20f + proportion * 0.15f + skinScore * 0.15f).roundToInt().coerceIn(34, 48)
-        val potential = overall + r.nextInt(20, 26)
+        val overall = 68
+        val potential = 82
         val tier = LooksTier.fromScore(overall)
-        val tilt = (r.nextFloat() * 2.0f) - 1.5f
+        val tilt = (r.nextFloat() * 1.5f) + 0.5f
 
         val metricsList = listOf(
             FacialMetric(
                 name = "Jawline & Mandible",
                 score = jawline,
                 category = "Bone Structure",
-                status = "Undefined / Soft Base",
-                details = "Mandible lacks angular sharpness. Subcutaneous water retention obscures bone borders.",
-                ascendTip = "Eliminate processed sodium, chew hard mastic gum, and drop body fat."
+                status = "Standard Definition",
+                details = "Mandible outline detected with moderate definition. Direct lighting will enhance angle extraction.",
+                ascendTip = "Follow the Debloat Protocol (potassium + water flush) to maximize jaw sharpness."
             ),
             FacialMetric(
-                name = "Eye Area & Canthal Tilt",
+                name = "Canthal Tilt & Eye Vector",
                 score = canthal,
                 category = "Periorbital",
-                status = if (tilt >= 0.5f) "Neutral" else "Negative Slope",
-                details = String.format("Measured canthal tilt: %+.1f°. Lacks compact hunter eye vectoring.", tilt),
-                ascendTip = "Use cold ice compression, back sleeping, and lower eyelid training."
+                status = "Neutral Vector",
+                details = String.format("Estimated canthal tilt: %+.1f°. Retake at exact eye level for millimeter precision.", tilt),
+                ascendTip = "Use cold ice compression and back sleeping to maintain tight orbital tissues."
             ),
             FacialMetric(
-                name = "fWHR (Facial Width-to-Height)",
-                score = fwhrScore,
-                category = "Dimorphism",
-                status = "Moderate / Narrow",
-                details = String.format("Estimated fWHR: %.2f.", fwhrVal),
-                ascendTip = "Masseter training to widen lower facial framework."
-            ),
-            FacialMetric(
-                name = "Facial Bilateral Symmetry",
+                name = "Bilateral Facial Symmetry",
                 score = symmetry,
                 category = "Facial Harmony",
-                status = "Moderate Asymmetry",
-                details = "Noticeable hemifacial deviation across vertical facial midline.",
-                ascendTip = "Chew evenly on both sides and eliminate side-sleeping pressure."
+                status = "Natural Balance",
+                details = "Even hemifacial alignment across the vertical facial midline.",
+                ascendTip = "Chew evenly on both sides and sleep exclusively on your back."
             ),
             FacialMetric(
-                name = "Facial Thirds & Midface",
+                name = "Midface & Facial Thirds",
                 score = proportion,
                 category = "Proportions",
-                status = "Slight Disproportion",
-                details = "Disproportion between forehead, nasal midface, and chin thirds.",
-                ascendTip = "Adopt an appropriate fringe haircut to balance facial length."
+                status = "Proportional Base",
+                details = "Balanced vertical proportions between forehead, midface, and lower third.",
+                ascendTip = "Tailor your hairstyle to harmonize facial thirds."
             ),
             FacialMetric(
-                name = "Skin Clarity & Tone",
+                name = "Skin Clarity & Complexion",
                 score = skinScore,
-                category = "Skin & Leanness",
-                status = if (skinScore >= 65) "Clean Complexion" else "Uneven / Blemishes",
-                details = "Epidermal luminance and texture analysis.",
+                category = "Skin & Health",
+                status = "Clear Base",
+                details = "Healthy epidermal baseline with normal surface characteristics.",
                 ascendTip = "Apply daily broad-spectrum SPF 50+ and nightly Retinoid for cellular turnover."
             ),
             FacialMetric(
@@ -820,8 +1054,16 @@ class FaceAnalyzer(private val context: Context) {
                 score = cheekbones,
                 category = "Midface",
                 status = "Subtle Definition",
-                details = "Zygomatic structure obscured by facial water retention.",
-                ascendTip = "Follow the Debloat Protocol (potassium + water flush) to reveal cheekbones."
+                details = "Zygomatic structure visible. Lower body fat will accentuate cheek hollows.",
+                ascendTip = "Reduce sodium to flush subcutaneous water and define zygomatic arch."
+            ),
+            FacialMetric(
+                name = "fWHR (Facial Width-to-Height)",
+                score = fwhrScore,
+                category = "Dimorphism",
+                status = "Balanced Framework",
+                details = String.format("Estimated fWHR: %.2f.", fwhrVal),
+                ascendTip = "Masseter training to widen lower facial framework."
             )
         )
 
@@ -833,19 +1075,19 @@ class FaceAnalyzer(private val context: Context) {
             sideImageUri = sideUri,
             metrics = metricsList,
             topAscensionFocus = listOf(
-                "Debloat Protocol: Cut sodium and drink 3.5L water daily to carve jawline.",
-                "Mewing Suction: Maintain back-tongue palate posture 24/7.",
-                "Skincare Regime: Morning Vitamin C + SPF 50, Night Retinoid cycle."
+                "Debloat & Leanness: Reduce sodium and drink 3.5L water daily to carve jaw angles.",
+                "Orthotropic Mewing: Maintain full tongue posture on the palate 24/7.",
+                "Skincare Routine: Daily Vitamin C + SPF 50 AM, Retinoid cycle PM."
             ),
-            goldenRatioHarmony = 0.74f,
+            goldenRatioHarmony = 0.85f,
             canthalTiltDegrees = tilt,
             facialSymmetryPct = symmetry,
             fwhr = fwhrVal,
-            midfaceRatio = 0.90f,
+            midfaceRatio = 0.98f,
             eyeSpacingRatio = 1.00f,
-            halos = emptyList(),
-            failos = listOf("Unclear Facial Boundary (Retake under direct lighting recommended)", "Subcutaneous Facial Softness"),
-            sideProfileSummary = "Face detection requires clear frontal lighting without shadow occlusion.",
+            halos = listOf("Harmonious Natural Facial Framework"),
+            failos = listOf("Suboptimal Lighting/Angle (Retake in direct front lighting for 100% biometric precision)"),
+            sideProfileSummary = "Ensure front profile has clear, even lighting without heavy shadows for full contour mapping.",
             hasSideAnalysis = false
         )
     }

@@ -159,23 +159,25 @@ fun ResultsScreen(
                 label = "fWHR",
                 value = String.format("%.2f", result.fwhr),
                 subtext = when {
-                    result.fwhr in 1.84f..2.05f -> "Apex Dimorphic"
-                    result.fwhr in 1.74f..1.83f -> "Favorable"
-                    result.fwhr in 1.63f..1.73f -> "Standard"
+                    result.fwhr in 1.84f..2.06f -> "Apex Dimorphic"
+                    result.fwhr in 1.74f..1.84f -> "Favorable"
+                    result.fwhr in 1.64f..1.74f -> "Standard"
+                    result.fwhr > 2.06f -> "Compact Wide"
                     else -> "Narrow Face"
                 },
-                accentColor = if (result.fwhr in 1.82f..2.05f) NeonCyan else if (result.fwhr in 1.70f..1.82f) NeonGold else NeonRose,
+                accentColor = if (result.fwhr in 1.74f..2.10f) NeonCyan else if (result.fwhr >= 1.62f) NeonGold else NeonRose,
                 modifier = Modifier.weight(1f)
             )
             QuickStatCard(
                 label = "MIDFACE RATIO",
                 value = String.format("%.2f", result.midfaceRatio),
                 subtext = when {
-                    result.midfaceRatio in 0.98f..1.08f -> "Compact Ideal"
-                    result.midfaceRatio in 0.92f..0.97f -> "Balanced"
+                    result.midfaceRatio in 0.98f..1.12f -> "Compact Ideal"
+                    result.midfaceRatio in 0.92f..0.98f -> "Balanced"
+                    result.midfaceRatio > 1.12f -> "Ultra Compact"
                     else -> "Elongated"
                 },
-                accentColor = if (result.midfaceRatio in 0.96f..1.08f) NeonCyan else if (result.midfaceRatio in 0.90f..0.96f) NeonGold else NeonRose,
+                accentColor = if (result.midfaceRatio in 0.96f..1.15f) NeonCyan else if (result.midfaceRatio in 0.88f..0.96f) NeonGold else NeonRose,
                 modifier = Modifier.weight(1f)
             )
             QuickStatCard(
